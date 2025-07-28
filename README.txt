@@ -44,6 +44,8 @@ Important Notes
     Excelfile Ticker Import: tradeList.xlsx(or other excel file) must have no headers.
         Column A: Ticker (e.g., AAPL)
         Column B: Date (format: YYYY-MM-DD)
+        Column C: Grade (A, B, C)
+        Column D: CAP (Micro, Small, Medium, Large, ETF)
 
     Output:
     The program will create an Excel file (e.g., all_capitulation_results.xlsx) with:
