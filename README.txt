@@ -13,7 +13,7 @@ capitulationAnalyzer/
 │
 ├── userConfig.py              # Main file to run — set your inputs and run this script.
 ├── shelConfig.py              # Stores SHEL_USERNAME and SHEL_PASSWORD credentials.
-├── tradeList.xlsx             # Excel input file with tickers and dates (two columns: Ticker, Date).
+├── tradeList.xlsx             # Excel input file with tickers, dates, grade, cap(four columns: Ticker, Date, Grade, Cap).
 │
 ├── backtester/
 │   ├── batchBacktest.py       # Logic to loop through tickers/dates/intervals and run backtests.
@@ -49,8 +49,10 @@ Important Notes
 
     Output:
     The program will create an Excel file (e.g., all_capitulation_results.xlsx) with:
-        Sheet 1: Individual trade results
-        Sheet 2: Summary grouped by interval
+        Sheet 1: Raw Data
+        Sheet 2: Individual trade results
+        Sheet 3: Summary grouped by interval
+        Sheet 4: Cap and Grade Analysis
 
     Error Handling:
         If invalid SHEL credentials are provided, the script will print "Authentication failed" and skip processing.
