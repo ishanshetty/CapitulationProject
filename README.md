@@ -1,4 +1,3 @@
-==========================
 Capitulation Backtester
 ==========================
 
@@ -40,8 +39,9 @@ How to Run:
 3. Run the file:
    python3 userConfig.py
 
-Important Notes
-    Excelfile Ticker Import: tradeList.xlsx(or other excel file) must have no headers.
+Important Notes: Excel file 
+
+Ticker Import: tradeList.xlsx(or other excel file) must have no headers.
         Column A: Ticker (e.g., AAPL)
         Column B: Date (format: YYYY-MM-DD)
         Column C: Grade (A, B, C)
