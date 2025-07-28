@@ -1,0 +1,1826 @@
+
+# BATCH TEST FILE CHANGES
+
+import pandas as pd
+import sys
+import os
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from marketData.fetchData import fetch_intraday_bars
+from backtester.analyze import run_capitulation_short_strategy_with_metrics
+
+def backtest_multiple_trades(excel_path, intervals, start_time, end_time, output_path):
+    trades = pd.read_excel(excel_path, header=None, names=["Ticker", "Date"])
+    all_results = []
+    raw_data_sheets = {}
+
+    for idx, row in trades.iterrows():
+        ticker = row["Ticker"]
+        date = pd.to_datetime(row["Date"]).strftime("%Y-%m-%d")
+        print(f"\nBacktesting {ticker} on {date}...")
+
+        for interval in intervals:
+            print(f" → Interval: {interval}")
+            df = fetch_intraday_bars(ticker, date, interval=interval)
+
+            if df.empty:
+                print(f"No data for {ticker} on {date} at {interval}")
+                continue
+
+            # Keep original df for backtesting
+            df_for_backtest = df.copy()
+
+            # Prepare raw data for Excel export
+            df_raw = df.copy().reset_index()
+            df_raw.rename(columns={df_raw.columns[0]: 'timestamp'}, inplace=True)
+
+            # No conversion needed since timestamp is already datetime
+            # df_raw['timestamp'] = pd.to_datetime(df_raw['timestamp'], unit='D', origin='1899-12-30')  # Removed
+
+            raw_data_sheets[f"{ticker}_{interval}"] = df_raw
+
+            # Run strategy on df with DatetimeIndex
+            stats = run_capitulation_short_strategy_with_metrics(df_for_backtest, start_time, end_time)
+
+            result = {
+                "Ticker": ticker,
+                "Date": date,
+                "Interval": interval,
+                "P&L": round(stats.get("pnl", 0), 2),
+                "EV": round(stats.get("EV", 0), 2),
+                "Win Rate (%)": round(stats.get("win_rate", 0) / 100, 4),
+                "Avg R/R": round(stats.get("avg_risk_reward", 0), 2),
+                "Total Trades": stats.get("total_trades", 0),
+                "Wins": stats.get("wins", 0),
+                "Losses": stats.get("losses", 0),
+                "Max P&L": round(stats.get("max_pnl", 0), 2),
+                "Min P&L": round(stats.get("min_pnl", 0), 2),
+                "Total % Return": round(stats.get("total_percent_return", 0) / 100, 4),
+                "Avg % Return": round(stats.get("avg_percent_return", 0) / 100, 4),
+            }
+
+            all_results.append(result)
+
+    summary_df = pd.DataFrame(all_results)
+
+    interval_summary = summary_df.groupby("Interval").agg({
+        "P&L": "sum",
+        "EV": "mean",
+        "Win Rate (%)": "mean",
+        "Avg R/R": "mean",
+        "Total % Return": "sum",
+        "Avg % Return": "mean"
+    }).reset_index()
+
+    interval_summary = interval_summary.rename(columns={
+        "P&L": "Total P&L",
+        "EV": "Avg EV",
+        "Win Rate (%)": "Avg Win Rate (%)",
+        "Avg R/R": "Avg Risk/Reward",
+        "Total % Return": "Total % Return",
+        "Avg % Return": "Avg % Return"
+    })
+
+    interval_summary["Avg EV"] = interval_summary["Avg EV"].round(2)
+    interval_summary["Avg Risk/Reward"] = interval_summary["Avg Risk/Reward"].round(2)
+    interval_summary["SortKey"] = interval_summary["Interval"].str.extract(r'(\d+)').astype(int)
+    interval_summary = interval_summary.sort_values(by="SortKey").drop(columns=["SortKey"])
+
+    pivot_df = summary_df.pivot_table(index="Ticker", columns="Interval", values="EV", aggfunc="mean").reset_index()
+    chart_start_row = len(interval_summary) + 5
+
+    with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
+        workbook = writer.book
+
+        # === Raw Data Sheet (Formatted) ===
+        raw_sheet_name = "Raw Data"
+        raw_ws = workbook.add_worksheet(raw_sheet_name)
+        writer.sheets[raw_sheet_name] = raw_ws
+
+        header_format = workbook.add_format({
+            'bold': True,
+            'align': 'center',
+            'valign': 'vcenter',
+            'border': 1,
+            'bg_color': '#D9D9D9'
+        })
+
+        # Add date format for timestamp column
+        date_format = workbook.add_format({'num_format': 'yyyy-mm-dd hh:mm:ss', 'align': 'center'})
+
+        col_format = workbook.add_format({'align': 'center'})
+        start_row = 0
+
+        for sheet_name, df_raw in raw_data_sheets.items():
+            ticker, interval = sheet_name.split('_')
+            interval_num = interval.replace('min', '')
+            date_str = pd.to_datetime(df_raw['timestamp'].iloc[0]).strftime("%Y-%m-%d")
+            header_title = f"{ticker} - Interval: {interval_num}min [{date_str}]"
+
+            # Merge header row
+            raw_ws.merge_range(start_row, 0, start_row, len(df_raw.columns)-1, header_title, header_format)
+
+            # Write column headers
+            for col_idx, col_name in enumerate(df_raw.columns):
+                raw_ws.write(start_row + 1, col_idx, col_name, header_format)
+
+            # Write data with date formatting for timestamp
+            for row_idx, (_, row) in enumerate(df_raw.iterrows()):
+                for col_idx, col_name in enumerate(df_raw.columns):
+                    val = row[col_name]
+                    if col_name == 'timestamp':
+                        raw_ws.write_datetime(start_row + 2 + row_idx, col_idx, val, date_format)
+                    else:
+                        raw_ws.write(start_row + 2 + row_idx, col_idx, val, col_format)
+
+            # Auto column width
+            for col_idx, col_name in enumerate(df_raw.columns):
+                max_len = max(df_raw[col_name].astype(str).map(len).max(), len(col_name)) + 2
+                raw_ws.set_column(col_idx, col_idx, max_len)
+
+            # Move to next block
+            start_row += len(df_raw) + 3
+
+        # === Summary sheets ===
+        summary_df.to_excel(writer, sheet_name="Trade Results", index=False)
+        interval_summary.to_excel(writer, sheet_name="Summary by Interval", index=False)
+        pivot_df.to_excel(writer, sheet_name="Summary by Interval", index=False, startrow=chart_start_row)
+
+        summary_ws = writer.sheets["Summary by Interval"]
+        results_ws = writer.sheets["Trade Results"]
+
+        # Format Trade Results
+        for i, column in enumerate(summary_df.columns):
+            max_len = max(summary_df[column].astype(str).map(len).max(), len(column)) + 2
+            fmt = None
+            if column in ["Win Rate (%)", "Total % Return", "Avg % Return"]:
+                fmt = workbook.add_format({'num_format': '0.00%', 'align': 'center'})
+            results_ws.set_column(i, i, max_len, fmt)
+
+        # Format Summary by Interval
+        for i, column in enumerate(interval_summary.columns):
+            col_data = interval_summary[column]
+            if column in ["Avg Win Rate (%)", "Total % Return", "Avg % Return"]:
+                formatted_vals = col_data.apply(lambda x: f"{x * 100:.2f}%")
+                max_len = max(formatted_vals.map(len).max(), len(column)) + 2
+                fmt = workbook.add_format({'num_format': '0.00%', 'align': 'center'})
+            else:
+                formatted_vals = col_data.astype(str)
+                max_len = max(formatted_vals.map(len).max(), len(column)) + 2
+                fmt = None
+            summary_ws.set_column(i, i, max_len, fmt)
+
+        # Format Pivot table
+        number_format = workbook.add_format({'num_format': '0.00', 'align': 'center'})
+        for j in range(1, len(pivot_df.columns)):
+            summary_ws.set_column(j, j, 10, number_format)
+
+        # Recreate pivot for chart
+        pivot_df_chart = summary_df.pivot_table(index="Ticker", values="EV", columns="Interval", aggfunc="mean")
+        pivot_df_chart = pivot_df_chart[sorted(pivot_df_chart.columns, key=lambda x: int(x.replace('min', '')))]
+        pivot_df_chart = pivot_df_chart.reset_index()
+        pivot_df_chart.to_excel(writer, sheet_name="Summary by Interval", index=False, startrow=chart_start_row)
+
+        # Add chart
+        chart = workbook.add_chart({'type': 'column'})
+        chart.add_series({
+            'name': 'Avg EV',
+            'categories': ['Summary by Interval', 1, 0, len(interval_summary), 0],
+            'values': ['Summary by Interval', 1, 2, len(interval_summary), 2],
+            'fill': {'color': '#BFBFBF'},
+            'border': {'color': 'black'}
+        })
+
+        # Overlay ticker line charts
+        for i in range(len(pivot_df)):
+            ticker = pivot_df.loc[i, "Ticker"]
+            chart.add_series({
+                'name':       ticker,
+                'categories': ['Summary by Interval', chart_start_row, 1,
+                               chart_start_row, len(pivot_df.columns) - 1],
+                'values':     ['Summary by Interval', chart_start_row + 1 + i, 1,
+                               chart_start_row + 1 + i, len(pivot_df.columns) - 1],
+                'type': 'line',
+                'marker': {'type': 'circle', 'size': 4}
+            })
+
+        chart.set_title({'name': 'Interval vs Avg EV (w/ Ticker Overlay)'})
+        chart.set_x_axis({'name': 'Interval', 'label_position': 'low'})
+        chart.set_y_axis({'name': 'Expected Value'})
+        chart.set_size({'width': 720, 'height': 400})
+        summary_ws.insert_chart("I2", chart)
+
+
+
+    print(f"All done! Results saved to '{output_path}'")
+#nbbo
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+//////ISHAN EDITS
+analyze --- 
+import pandas as pd
+
+def run_capitulation_short_strategy_with_metrics(df, start_time="09:30", end_time="16:00"):
+    position = None
+    entry_price = None
+    stop_price = None
+    high_of_day = float('-inf')
+    total_pnl = 0.0
+    total_percent_return = 0.0
+    wins = 0
+    losses = 0
+    risk_reward_ratios = []
+    individual_pnls = []
+    percent_returns = []
+    win_pnls = []
+    loss_pnls = []
+    num_trades = 0
+
+    df_filtered = df.between_time("04:00", "20:00")
+    times = df_filtered.index
+    
+    #just added
+    high_of_day = -float('inf')
+    capitulation_occurred = False                          
+    #just added
+
+    for i in range(1, len(times)):
+        curr_time = times[i]
+        prev = df_filtered.loc[times[i - 1]]
+        curr = df_filtered.loc[times[i]]
+
+        high_of_day = max(high_of_day, curr["high"])
+        current_time = curr_time.time()
+        start_t = pd.to_datetime(start_time).time()
+        end_t = pd.to_datetime(end_time).time()
+
+
+        if position is None and not (start_t <= current_time <= end_t):
+            continue
+
+        ### [ADDED] -- Stop scanning for new trades after capitulation
+        if position is None and capitulation_occurred:
+            continue
+
+        if position is None:
+            if curr["low"] < prev["low"]:
+                entry_price = prev["low"]
+                stop_price = high_of_day
+                position = "short"
+                num_trades += 1
+                print(f"[{curr_time}] ENTER SHORT @ {entry_price:.2f} | Initial Stop: {stop_price:.2f}")
+
+        elif position == "short":
+            trailing_stop = prev["high"]
+            if trailing_stop < stop_price:
+                print(f"[{curr_time}] TRAIL STOP adjusted: {stop_price:.2f} → {trailing_stop:.2f}")
+                stop_price = trailing_stop
+
+            if curr["high"] >= stop_price:
+                exit_price = stop_price
+                pnl = entry_price - exit_price
+                percent_return = (pnl / entry_price) * 100
+                risk = high_of_day - entry_price
+                reward = entry_price - exit_price
+                #rr_ratio = risk / reward if reward != 0 else float('inf')
+                rr_ratio = reward / risk if risk > 0 else 0
+
+
+                print(f"[{curr_time}] EXIT SHORT @ {exit_price:.2f}")
+                print(f"P&L: {pnl:.2f} | % Return: {percent_return:.2f}% | Risk: {risk:.2f} | Reward: {reward:.2f} | R/R: {rr_ratio:.2f}\n")
+
+                total_pnl += pnl
+                total_percent_return += percent_return
+                individual_pnls.append(pnl)
+                percent_returns.append(percent_return)
+
+                if pnl > 0:
+                    win_pnls.append(pnl)
+                    wins += 1
+                else:
+                    loss_pnls.append(pnl)
+                    losses += 1
+
+                risk_reward_ratios.append(rr_ratio)
+                position = None
+
+                # NEW: Check if move from high of day to exit was ≥10%
+                drop_from_high = (high_of_day - exit_price) / high_of_day
+                if drop_from_high >= 0.10:
+                    capitulation_occurred = True
+
+    if position == "short":
+        final_close = df_filtered.iloc[-1]["close"]
+        pnl = entry_price - final_close
+        percent_return = (pnl / entry_price) * 100
+        risk = max(stop_price - entry_price, 0.01)
+        reward = abs(entry_price - final_close)
+        #rr_ratio = risk / reward if reward != 0 else float('inf')
+        rr_ratio = reward / risk if risk > 0 else 0
+
+
+        #print(f"[{df_filtered.index[-1]}] EOD EXIT SHORT @ {final_close:.2f}")
+        #print(f"P&L: {pnl:.2f} | % Return: {percent_return:.2f}% | Risk: {risk:.2f} | Reward: {reward:.2f} | R/R: {rr_ratio:.2f}\n")
+
+        total_pnl += pnl
+        total_percent_return += percent_return
+        individual_pnls.append(pnl)
+        percent_returns.append(percent_return)
+
+        if pnl > 0:
+            win_pnls.append(pnl)
+            wins += 1
+        else:
+            loss_pnls.append(pnl)
+            losses += 1
+
+        risk_reward_ratios.append(rr_ratio)
+
+    win_rate = wins / num_trades if num_trades > 0 else 0
+    loss_rate = losses / num_trades if num_trades > 0 else 0
+    avg_win = sum(win_pnls) / len(win_pnls) if win_pnls else 0
+    avg_loss = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0
+    expected_value = (win_rate * avg_win) + (loss_rate * avg_loss)
+
+    avg_rr = sum(risk_reward_ratios) / len(risk_reward_ratios) if risk_reward_ratios else 0
+    max_pnl = max(individual_pnls) if individual_pnls else 0
+    min_pnl = min(individual_pnls) if individual_pnls else 0
+    avg_percent_return = sum(percent_returns) / len(percent_returns) if percent_returns else 0
+
+    return {
+        "pnl": round(total_pnl, 2),
+        "EV": round(expected_value, 2),
+        "win_rate": round(win_rate * 100, 2),
+        "avg_risk_reward": round(avg_rr, 2),
+        "total_trades": num_trades,
+        "wins": wins,
+        "losses": losses,
+        "max_pnl": round(max_pnl, 2),
+        "min_pnl": round(min_pnl, 2),
+        "total_percent_return": round(total_percent_return, 2),
+        "avg_percent_return": round(avg_percent_return, 2)
+    }
+
+
+
+
+batch back test FILE
+
+import pandas as pd
+import sys
+import os
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from marketData.fetchData import fetch_intraday_bars
+from backtester.analyze import run_capitulation_short_strategy_with_metrics
+
+def backtest_multiple_trades(excel_path, intervals, start_time, end_time, output_path):
+    trades = pd.read_excel(excel_path, header=None, names=["Ticker", "Date"])
+    all_results = []
+    raw_data_sheets = {}
+
+    for idx, row in trades.iterrows():
+        ticker = row["Ticker"]
+        date = pd.to_datetime(row["Date"]).strftime("%Y-%m-%d")
+        print(f"\nBacktesting {ticker} on {date}...")
+
+        for interval in intervals:
+            print(f" → Interval: {interval}")
+            df = fetch_intraday_bars(ticker, date, interval=interval)
+
+            if df.empty:
+                print(f"No data for {ticker} on {date} at {interval}")
+                continue
+
+            # Keep original df for backtesting
+            df_for_backtest = df.copy()
+
+            # Prepare raw data for Excel export
+            df_raw = df.copy().reset_index()
+            df_raw.rename(columns={df_raw.columns[0]: 'timestamp'}, inplace=True)
+
+            # No conversion needed since timestamp is already datetime
+            # df_raw['timestamp'] = pd.to_datetime(df_raw['timestamp'], unit='D', origin='1899-12-30')  # Removed
+
+            raw_data_sheets[f"{ticker}_{interval}"] = df_raw
+
+            # Run strategy on df with DatetimeIndex
+            stats = run_capitulation_short_strategy_with_metrics(df_for_backtest, start_time, end_time)
+
+            result = {
+                "Ticker": ticker,
+                "Date": date,
+                "Interval": interval,
+                "P&L": round(stats.get("pnl", 0), 2),
+                "EV": round(stats.get("EV", 0), 2),
+                "Win Rate (%)": round(stats.get("win_rate", 0) / 100, 4),
+                "Avg R/R": round(stats.get("avg_risk_reward", 0), 2),
+                "Total Trades": stats.get("total_trades", 0),
+                "Wins": stats.get("wins", 0),
+                "Losses": stats.get("losses", 0),
+                "Max P&L": round(stats.get("max_pnl", 0), 2),
+                "Min P&L": round(stats.get("min_pnl", 0), 2),
+                "Total % Return": round(stats.get("total_percent_return", 0) / 100, 4),
+                "Avg % Return": round(stats.get("avg_percent_return", 0) / 100, 4),
+            }
+
+            all_results.append(result)
+
+    summary_df = pd.DataFrame(all_results)
+
+    interval_summary = summary_df.groupby("Interval").agg({
+        "P&L": "sum",
+        "EV": "mean",
+        "Win Rate (%)": "mean",
+        "Avg R/R": "mean",
+        "Total % Return": "sum",
+        "Avg % Return": "mean"
+    }).reset_index()
+
+    interval_summary = interval_summary.rename(columns={
+        "P&L": "Total P&L",
+        "EV": "Avg EV",
+        "Win Rate (%)": "Avg Win Rate (%)",
+        "Avg R/R": "Avg Risk/Reward",
+        "Total % Return": "Total % Return",
+        "Avg % Return": "Avg % Return"
+    })
+
+    interval_summary["Avg EV"] = interval_summary["Avg EV"].round(2)
+    interval_summary["Avg Risk/Reward"] = interval_summary["Avg Risk/Reward"].round(2)
+    interval_summary["SortKey"] = interval_summary["Interval"].str.extract(r'(\d+)').astype(int)
+    interval_summary = interval_summary.sort_values(by="SortKey").drop(columns=["SortKey"])
+
+    pivot_df = summary_df.pivot_table(index="Ticker", columns="Interval", values="EV", aggfunc="mean").reset_index()
+    chart_start_row = len(interval_summary) + 5
+
+    with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
+        workbook = writer.book
+
+        # === Raw Data Sheet (Formatted) ===
+        raw_sheet_name = "Raw Data"
+        raw_ws = workbook.add_worksheet(raw_sheet_name)
+        writer.sheets[raw_sheet_name] = raw_ws
+
+        header_format = workbook.add_format({
+            'bold': True,
+            'align': 'center',
+            'valign': 'vcenter',
+            'border': 1,
+            'bg_color': '#D9D9D9'
+        })
+
+        # Add date format for timestamp column
+        date_format = workbook.add_format({'num_format': 'yyyy-mm-dd hh:mm:ss', 'align': 'center'})
+
+        col_format = workbook.add_format({'align': 'center'})
+        start_row = 0
+
+        for sheet_name, df_raw in raw_data_sheets.items():
+            ticker, interval = sheet_name.split('_')
+            interval_num = interval.replace('min', '')
+            date_str = pd.to_datetime(df_raw['timestamp'].iloc[0]).strftime("%Y-%m-%d")
+            header_title = f"{ticker} - Interval: {interval_num}min [{date_str}]"
+
+            # Merge header row
+            raw_ws.merge_range(start_row, 0, start_row, len(df_raw.columns)-1, header_title, header_format)
+
+            # Write column headers
+            for col_idx, col_name in enumerate(df_raw.columns):
+                raw_ws.write(start_row + 1, col_idx, col_name, header_format)
+
+            # Write data with date formatting for timestamp
+            for row_idx, (_, row) in enumerate(df_raw.iterrows()):
+                for col_idx, col_name in enumerate(df_raw.columns):
+                    val = row[col_name]
+                    if col_name == 'timestamp':
+                        raw_ws.write_datetime(start_row + 2 + row_idx, col_idx, val, date_format)
+                    else:
+                        raw_ws.write(start_row + 2 + row_idx, col_idx, val, col_format)
+
+            # Auto column width
+            for col_idx, col_name in enumerate(df_raw.columns):
+                max_len = max(df_raw[col_name].astype(str).map(len).max(), len(col_name)) + 2
+                raw_ws.set_column(col_idx, col_idx, max_len)
+
+            # Move to next block
+            start_row += len(df_raw) + 3
+
+        # === Summary sheets ===
+        summary_df.to_excel(writer, sheet_name="Trade Results", index=False)
+        interval_summary.to_excel(writer, sheet_name="Summary by Interval", index=False)
+        pivot_df.to_excel(writer, sheet_name="Summary by Interval", index=False, startrow=chart_start_row)
+
+        summary_ws = writer.sheets["Summary by Interval"]
+        results_ws = writer.sheets["Trade Results"]
+
+        # Format Trade Results
+        for i, column in enumerate(summary_df.columns):
+            max_len = max(summary_df[column].astype(str).map(len).max(), len(column)) + 2
+            fmt = None
+            if column in ["Win Rate (%)", "Total % Return", "Avg % Return"]:
+                fmt = workbook.add_format({'num_format': '0.00%', 'align': 'center'})
+            results_ws.set_column(i, i, max_len, fmt)
+
+        # Format Summary by Interval
+        for i, column in enumerate(interval_summary.columns):
+            col_data = interval_summary[column]
+            if column in ["Avg Win Rate (%)", "Total % Return", "Avg % Return"]:
+                formatted_vals = col_data.apply(lambda x: f"{x * 100:.2f}%")
+                max_len = max(formatted_vals.map(len).max(), len(column)) + 2
+                fmt = workbook.add_format({'num_format': '0.00%', 'align': 'center'})
+            else:
+                formatted_vals = col_data.astype(str)
+                max_len = max(formatted_vals.map(len).max(), len(column)) + 2
+                fmt = None
+            summary_ws.set_column(i, i, max_len, fmt)
+
+        # Format Pivot table
+        number_format = workbook.add_format({'num_format': '0.00', 'align': 'center'})
+        for j in range(1, len(pivot_df.columns)):
+            summary_ws.set_column(j, j, 10, number_format)
+
+        # Recreate pivot for chart
+        pivot_df_chart = summary_df.pivot_table(index="Ticker", values="EV", columns="Interval", aggfunc="mean")
+        pivot_df_chart = pivot_df_chart[sorted(pivot_df_chart.columns, key=lambda x: int(x.replace('min', '')))]
+        pivot_df_chart = pivot_df_chart.reset_index()
+        pivot_df_chart.to_excel(writer, sheet_name="Summary by Interval", index=False, startrow=chart_start_row)
+
+        # Add chart
+        chart = workbook.add_chart({'type': 'column'})
+        chart.add_series({
+            'name': 'Avg EV',
+            'categories': ['Summary by Interval', 1, 0, len(interval_summary), 0],
+            'values': ['Summary by Interval', 1, 2, len(interval_summary), 2],
+            'fill': {'color': '#BFBFBF'},
+            'border': {'color': 'black'}
+        })
+
+        # Overlay ticker line charts
+        for i in range(len(pivot_df)):
+            ticker = pivot_df.loc[i, "Ticker"]
+            chart.add_series({
+                'name':       ticker,
+                'categories': ['Summary by Interval', chart_start_row, 1,
+                               chart_start_row, len(pivot_df.columns) - 1],
+                'values':     ['Summary by Interval', chart_start_row + 1 + i, 1,
+                               chart_start_row + 1 + i, len(pivot_df.columns) - 1],
+                'type': 'line',
+                'marker': {'type': 'circle', 'size': 4}
+            })
+
+        chart.set_title({'name': 'Interval vs Avg EV (w/ Ticker Overlay)'})
+        chart.set_x_axis({'name': 'Interval', 'label_position': 'low'})
+        chart.set_y_axis({'name': 'Expected Value'})
+        chart.set_size({'width': 720, 'height': 400})
+        summary_ws.insert_chart("I2", chart)
+
+
+
+    print(f"All done! Results saved to '{output_path}'")
+#nbbo
+
+
+
+
+
+### MORE DATA AFTER THE RECAP SLIDE
+
+/////////
+import pandas as pd
+import sys
+import os
+import io
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from marketData.fetchData import fetch_intraday_bars
+from backtester.analyze import run_capitulation_short_strategy_with_metrics
+
+def backtest_multiple_trades(excel_path, intervals, start_time, end_time, output_path):
+    # Read all four columns from the start
+    trades = pd.read_excel(excel_path, header=None, names=["Ticker", "Date", "Grade", "Cap"])
+    trades["Date"] = pd.to_datetime(trades["Date"], format='%m/%d/%y', errors='coerce').dt.strftime("%Y-%m-%d")  # Convert to match summary_df format
+    print(f"Raw trades data:\n{trades}")  # Debug print of raw input
+    print(f"trades dtypes: {trades.dtypes}")  # Debug print of data types
+    all_results = []
+    raw_data_sheets = {}
+    trade_logs = {}  # To store trade details for each ticker/interval
+
+    for idx, row in trades.iterrows():
+        ticker = row["Ticker"]
+        date = pd.to_datetime(row["Date"], format='%Y-%m-%d', errors='coerce')  # Parse MM/DD/YY format
+        if pd.isna(date):
+            print(f"Skipping invalid date for Ticker {ticker} at row {idx}: {row['Date']}")
+            continue
+        date = date.strftime("%Y-%m-%d")  # Convert to string format
+        grade = row["Grade"]
+        cap = row["Cap"]
+        print(f"\nBacktesting {ticker} on {date} (Grade: {grade}, Cap: {cap})...")
+
+        for interval in intervals:
+            print(f" → Processing {ticker}, {date}, {interval}")  # Debug print to track calls
+            df = fetch_intraday_bars(ticker, date, interval=interval)
+
+            if df.empty:
+                print(f"No data for {ticker} on {date} at {interval}")
+                continue
+
+            # Keep original df for backtesting
+            df_for_backtest = df.copy()
+
+            # Prepare raw data for Excel export
+            df_raw = df.copy().reset_index()
+            df_raw.rename(columns={df_raw.columns[0]: 'timestamp'}, inplace=True)
+
+            raw_data_sheets[f"{ticker}_{interval}"] = df_raw
+
+            # Capture trade prints
+            import sys
+            old_stdout = sys.stdout
+            sys.stdout = buffer = io.StringIO()
+            stats = run_capitulation_short_strategy_with_metrics(df_for_backtest, start_time, end_time)
+            trade_log = buffer.getvalue().splitlines()
+            sys.stdout = old_stdout
+            trade_logs[f"{ticker}_{interval}"] = trade_log
+
+            result = {
+                "Ticker": ticker,
+                "Date": date,
+                "Interval": interval,
+                "P&L": round(stats.get("pnl", 0), 2),
+                "EV": round(stats.get("EV", 0), 2),
+                "Win Rate (%)": round(stats.get("win_rate", 0) / 100, 4),
+                "Avg R/R": round(stats.get("avg_risk_reward", 0), 2),
+                "Total Trades": stats.get("total_trades", 0),
+                "Wins": stats.get("wins", 0),
+                "Losses": stats.get("losses", 0),
+                "Max P&L": round(stats.get("max_pnl", 0), 2),
+                "Min P&L": round(stats.get("min_pnl", 0), 2),
+                "Total % Return": round(stats.get("total_percent_return", 0) / 100, 4),
+                "Avg % Return": round(stats.get("avg_percent_return", 0) / 100, 4),
+                "EV/AVG RISK": round(stats.get("ev_risk", 0), 2),
+            }
+
+            all_results.append(result)
+
+    summary_df = pd.DataFrame(all_results).drop_duplicates(subset=["Ticker", "Interval", "Date"])  # Remove duplicates immediately
+
+    # Merge with trades to preserve original order and add index for sorting
+    summary_df = summary_df.merge(trades[["Ticker", "Date"]], on=["Ticker", "Date"], how="left")
+    summary_df['original_index'] = summary_df.apply(lambda row: trades.index[trades['Ticker'] == row['Ticker']][0], axis=1)
+    summary_df = summary_df.sort_values(by="original_index").drop(columns=["original_index"])
+
+    ############INTERVAL SUMMARY CODE (SHEET 3)
+    interval_summary = summary_df.groupby("Interval").agg({
+        "P&L": "sum",
+        "EV": "mean",
+        "Win Rate (%)": "mean",
+        "Avg R/R": "mean",
+        "Total % Return": "sum",
+        "Avg % Return": "mean",
+        "EV/AVG RISK": "mean",
+    }).reset_index()
+
+    interval_summary = interval_summary.rename(columns={
+        "P&L": "Total P&L",
+        "EV": "Avg EV",
+        "Win Rate (%)": "Avg Win Rate (%)",
+        "Avg R/R": "Avg Risk/Reward",
+        "Total % Return": "Total % Return",
+        "Avg % Return": "Avg % Return",
+        "EV/AVG RISK": "Avg EV/AVG RISK",
+    })
+
+    interval_summary["Avg EV"] = interval_summary["Avg EV"].round(2)
+    interval_summary["Avg Risk/Reward"] = interval_summary["Avg Risk/Reward"].round(2)
+    interval_summary["Avg EV/AVG RISK"] = interval_summary["Avg EV/AVG RISK"].round(2)
+    interval_summary["SortKey"] = interval_summary["Interval"].str.extract(r'(\d+)').astype(int)
+    interval_summary = interval_summary.sort_values(by="SortKey").drop(columns=["SortKey"])
+
+    pivot_df = summary_df.pivot_table(index="Ticker", columns="Interval", values="EV", aggfunc="mean").reset_index()
+    chart_start_row = len(interval_summary) + 5
+
+    with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
+        workbook = writer.book
+        workbook.nan_inf_to_errors = True  # Enable handling of NaN/Inf
+
+        # === Raw Data Sheet (Formatted) ===
+        raw_sheet_name = "Raw Data"
+        raw_ws = workbook.add_worksheet(raw_sheet_name)
+        writer.sheets[raw_sheet_name] = raw_ws
+
+        header_format = workbook.add_format({
+            'bold': True,
+            'align': 'center',
+            'valign': 'vcenter',
+            'border': 1,
+            'bg_color': '#D9D9D9'
+        })
+
+        # Add date format for timestamp column
+        date_format = workbook.add_format({'num_format': 'yyyy-mm-dd hh:mm:ss', 'align': 'center'})
+
+        col_format = workbook.add_format({'align': 'center'})
+        start_row = 0
+
+        for sheet_name, df_raw in raw_data_sheets.items():
+            ticker, interval = sheet_name.split('_')
+            interval_num = interval.replace('min', '')
+            date_str = pd.to_datetime(df_raw['timestamp'].iloc[0]).strftime("%Y-%m-%d")
+            header_title = f"{ticker} - Interval: {interval_num}min [{date_str}]"
+
+            # Merge header row
+            raw_ws.merge_range(start_row, 0, start_row, len(df_raw.columns)-1, header_title, header_format)
+
+            # Write column headers
+            for col_idx, col_name in enumerate(df_raw.columns):
+                raw_ws.write(start_row + 1, col_idx, col_name, header_format)
+
+            # Write data with date formatting for timestamp
+            for row_idx, (_, row) in enumerate(df_raw.iterrows()):
+                for col_idx, col_name in enumerate(df_raw.columns):
+                    val = row[col_name]
+                    if col_name == 'timestamp':
+                        raw_ws.write_datetime(start_row + 2 + row_idx, col_idx, val, date_format)
+                    else:
+                        raw_ws.write(start_row + 2 + row_idx, col_idx, val, col_format)
+
+            # Write trade log in column H starting at the first data row
+            trade_log = trade_logs.get(sheet_name, [])
+            trade_log_format = workbook.add_format({'align': 'left'})
+            first_data_row = start_row + 2  # Starts on the same row as the first timestamp
+            for log_idx, log_entry in enumerate(trade_log):
+                raw_ws.write(first_data_row + log_idx, 6, log_entry, trade_log_format)  # Column G is index 6
+
+            # Auto column width
+            for col_idx, col_name in enumerate(df_raw.columns):
+                max_len = max(df_raw[col_name].astype(str).map(len).max(), len(col_name)) + 2
+                if pd.isna(max_len):  # Safeguard against NaN
+                    max_len = 10
+                raw_ws.set_column(col_idx, col_idx, max_len)
+            # Auto size column G for trade logs
+            max_log_len = max([len(entry) for entry in trade_log] + [10]) if trade_log else 10
+            raw_ws.set_column(6, 6, max_log_len)
+
+            # Move to next block
+            start_row += len(df_raw) + 3
+
+        # === Summary sheets ===
+        summary_df.to_excel(writer, sheet_name="Trade Results", index=False, startrow=0)
+        interval_summary.to_excel(writer, sheet_name="Summary by Interval", index=False)
+        pivot_df.to_excel(writer, sheet_name="Summary by Interval", index=False, startrow=chart_start_row)
+
+        summary_ws = writer.sheets["Summary by Interval"]
+        results_ws = writer.sheets["Trade Results"]
+
+        # Write with spacing after each ticker group, preserving input order
+        current_row = 1  # Start after header
+        prev_ticker = None
+        for idx, row in summary_df.iterrows():
+            ticker = row["Ticker"]
+            if prev_ticker and ticker != prev_ticker:
+                current_row += 1  # Add an empty row before a new ticker
+            for col_idx, value in enumerate(row):
+                write_value = "" if pd.isna(value) else value
+                results_ws.write(current_row, col_idx, write_value)
+            current_row += 1
+            if idx == len(summary_df) - 1 or summary_df.iloc[idx + 1]["Ticker"] != ticker:
+                current_row += 1  # Add an empty row after the last entry for this ticker
+            prev_ticker = ticker
+
+        # Write header
+        for col_idx, column in enumerate(summary_df.columns):
+            results_ws.write(0, col_idx, column)
+
+        # Format Trade Results
+        for i, column in enumerate(summary_df.columns):
+            max_len = max(summary_df[column].astype(str).map(len).max(), len(column)) + 2
+            if pd.isna(max_len):  # Safeguard against NaN
+                max_len = 10
+            fmt = None
+            if column in ["Win Rate (%)", "Total % Return", "Avg % Return"]:
+                fmt = workbook.add_format({'num_format': '0.00%', 'align': 'center'})
+            elif column == "EV/AVG RISK":
+                fmt = workbook.add_format({'num_format': '0.00', 'align': 'center'})
+            results_ws.set_column(i, i, max_len, fmt)
+
+        # Format Summary by Interval
+        for i, column in enumerate(interval_summary.columns):
+            col_data = interval_summary[column]
+            max_len = max(col_data.astype(str).map(len).max(), len(column)) + 2
+            if pd.isna(max_len):  # Safeguard against NaN
+                max_len = 10
+            fmt = None
+            if column in ["Avg Win Rate (%)", "Total % Return", "Avg % Return"]:
+                formatted_vals = col_data.apply(lambda x: f"{x * 100:.2f}%")
+                max_len = max(formatted_vals.map(len).max(), len(column)) + 2
+                fmt = workbook.add_format({'num_format': '0.00%', 'align': 'center'})
+            elif column == "Avg EV/AVG RISK":
+                max_len = max(col_data.astype(str).map(len).max(), len(column)) + 2
+                fmt = workbook.add_format({'num_format': '0.00', 'align': 'center'})
+            else:
+                formatted_vals = col_data.astype(str)
+                max_len = max(formatted_vals.map(len).max(), len(column)) + 2
+                fmt = None
+            summary_ws.set_column(i, i, max_len, fmt)
+
+        # Format Pivot table
+        number_format = workbook.add_format({'num_format': '0.00', 'align': 'center'})
+        for j in range(1, len(pivot_df.columns)):
+            max_len = max(pivot_df.iloc[:, j].astype(str).map(len).max(), len(pivot_df.columns[j])) + 2
+            if pd.isna(max_len):  # Safeguard against NaN
+                max_len = 10
+            summary_ws.set_column(j, j, max_len, number_format)
+
+        # Recreate pivot for chart
+        pivot_df_chart = summary_df.pivot_table(index="Ticker", values="EV", columns="Interval", aggfunc="mean")
+        pivot_df_chart = pivot_df_chart[sorted(pivot_df_chart.columns, key=lambda x: int(x.replace('min', '')))]
+        pivot_df_chart = pivot_df_chart.reset_index()
+        pivot_df_chart.to_excel(writer, sheet_name="Summary by Interval", index=False, startrow=chart_start_row)
+
+        # Add chart with one empty row above trade logs
+        chart_start_row_adjusted = start_row + 1  # One empty row before next block
+        chart = workbook.add_chart({'type': 'column'})
+        chart.add_series({
+            'name': 'Avg EV',
+            'categories': ['Summary by Interval', 1, 0, len(interval_summary), 0],
+            'values': ['Summary by Interval', 1, 2, len(interval_summary), 2],
+            'fill': {'color': '#BFBFBF'},
+            'border': {'color': 'black'}
+        })
+
+        # Overlay ticker line charts
+        for i in range(len(pivot_df)):
+            ticker = pivot_df.loc[i, "Ticker"]
+            chart.add_series({
+                'name': ticker,
+                'categories': ['Summary by Interval', chart_start_row_adjusted, 1, chart_start_row_adjusted, len(pivot_df.columns) - 1],
+                'values': ['Summary by Interval', chart_start_row_adjusted + 1 + i, 1, chart_start_row_adjusted + 1 + i, len(pivot_df.columns) - 1],
+                'type': 'line',
+                'marker': {'type': 'circle', 'size': 4'}
+            })
+
+        chart.set_title({'name': 'Interval vs Avg EV (w/ Ticker Overlay)'})
+        chart.set_x_axis({'name': 'Interval', 'label_position': 'low'})
+        chart.set_y_axis({'name': 'Expected Value'})
+        chart.set_size({'width': 720, 'height': 400})
+        summary_ws.insert_chart("I2", chart)
+
+        # === Cap & Grade Analysis Sheet (Last Page) ===
+        trades_full = pd.read_excel(excel_path, header=None, names=["Ticker", "Date", "Grade", "Cap"])
+        trades_full["Date"] = pd.to_datetime(trades_full["Date"], format='%m/%d/%y', errors='coerce').dt.strftime("%Y-%m-%d")
+        trades_full["Cap"] = trades_full["Cap"].str.lower().replace({"medium": "Medium"})  # Normalize cap sizes
+        print(f"trades_full dtypes: {trades_full.dtypes}")  # Debug print
+        print(f"summary_df dtypes: {summary_df.dtypes}")    # Debug print
+        # Merge to include all trades with Grade and Cap, filling NaN with 'Unknown'
+        cap_grade_df = trades_full.merge(summary_df, on=["Ticker", "Date"], how="left")
+        cap_grade_df["Grade"] = cap_grade_df["Grade"].fillna("Unknown")
+        cap_grade_df["Cap"] = cap_grade_df["Cap"].fillna("Unknown")
+        print(f"cap_grade_df:\n{cap_grade_df}")  # Debug print
+
+        # Group by Grade and Cap (without Ticker) to aggregate across all companies
+        grade_summary = cap_grade_df.groupby("Grade").agg({"EV": "mean"}).reset_index()
+        grade_summary = grade_summary.rename(columns={"EV": "Avg EV by Grade"})
+        cap_summary = cap_grade_df.groupby("Cap").agg({"EV": "mean"}).reset_index()
+        cap_summary = cap_summary.rename(columns={"EV": "Avg EV by Cap"})
+        print(f"grade_summary:\n{grade_summary}")  # Debug print
+        print(f"cap_summary:\n{cap_summary}")      # Debug print
+
+        analysis_ws = workbook.add_worksheet("Cap & Grade Analysis")
+
+        # Write Grade Analysis table
+        analysis_ws.write(0, 0, "Grade")
+        analysis_ws.write(0, 1, "Avg EV by Grade")
+        for i, row in grade_summary.iterrows():
+            analysis_ws.write(i + 1, 0, row["Grade"])
+            analysis_ws.write(i + 1, 1, row["Avg EV by Grade"])
+
+        # Write Cap Analysis table at P1 (column 15)
+        analysis_ws.write(0, 15, "Cap")
+        analysis_ws.write(0, 16, "Avg EV by Cap")
+        for i, row in cap_summary.iterrows():
+            analysis_ws.write(i + 1, 15, row["Cap"])
+            analysis_ws.write(i + 1, 16, row["Avg EV by Cap"])
+
+        # Format Grade Analysis
+        for i, column in enumerate(["Grade", "Avg EV by Grade"]):
+            max_len = max(grade_summary[column].astype(str).map(len).max(), len(column)) + 2 if not grade_summary.empty else 10
+            fmt = workbook.add_format({'num_format': '0.00', 'align': 'center'}) if column == "Avg EV by Grade" else workbook.add_format({'align': 'center'})
+            analysis_ws.set_column(i, i, max_len, fmt)
+
+        # Format Cap Analysis
+        for i, column in enumerate(["Cap", "Avg EV by Cap"]):
+            col_idx = i + 15  # Start at column 15 (P)
+            max_len = max(cap_summary[column].astype(str).map(len).max(), len(column)) + 2 if not cap_summary.empty else 10
+            fmt = workbook.add_format({'num_format': '0.00', 'align': 'center'}) if column == "Avg EV by Cap" else workbook.add_format({'align': 'center'})
+            analysis_ws.set_column(col_idx, col_idx, max_len, fmt)
+
+        # Add Grade chart at E2 (column 4, row 1)
+        if not grade_summary.empty:
+            grade_chart = workbook.add_chart({'type': 'column'})
+            grade_chart.add_series({
+                'name': 'Avg EV by Grade',
+                'categories': ['Cap & Grade Analysis', 1, 0, len(grade_summary), 0],  # Grade column
+                'values': ['Cap & Grade Analysis', 1, 1, len(grade_summary), 1],     # Avg EV by Grade
+                'fill': {'color': '#BFBFBF'},
+                'border': {'color': 'black'}
+            })
+            grade_chart.set_title({'name': 'Avg EV by Grade Across Companies'})
+            grade_chart.set_x_axis({'name': 'Grade', 'label_position': 'low'})
+            grade_chart.set_y_axis({'name': 'Avg Expected Value'})
+            grade_chart.set_size({'width': 720, 'height': 400})
+            analysis_ws.insert_chart('E2', grade_chart)
+
+        # Add Cap chart at S2 (column 18, row 1)
+        if not cap_summary.empty:
+            cap_chart = workbook.add_chart({'type': 'column'})
+            cap_chart.add_series({
+                'name': 'Avg EV by Cap',
+                'categories': ['Cap & Grade Analysis', 1, 15, len(cap_summary), 15],  # Cap column (P)
+                'values': ['Cap & Grade Analysis', 1, 16, len(cap_summary), 16],     # Avg EV by Cap
+                'fill': {'color': '#BFBFBF'},
+                'border': {'color': 'black'}
+            })
+            cap_chart.set_title({'name': 'Avg EV by Cap Type Across Companies'})
+            cap_chart.set_x_axis({'name': 'Cap Type', 'label_position': 'low'})
+            cap_chart.set_y_axis({'name': 'Avg Expected Value'})
+            cap_chart.set_size({'width': 720, 'height': 400})
+            analysis_ws.insert_chart('S2', cap_chart)
+
+    print(f"All done! Results saved to '{output_path}'")
+
+
+
+
+
+
+
+BROKEN ONE TRYING TO FIX 2:42 07/16/2025 
+
+########################################################
+import pandas as pd
+import sys
+import os
+import io
+import traceback
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from marketData.fetchData import fetch_intraday_bars
+from backtester.analyze import run_capitulation_short_strategy_with_metrics
+
+def backtest_multiple_trades(excel_path, intervals, start_time, end_time, output_path):
+    # Read all four columns from the start
+    try:
+        trades = pd.read_excel(excel_path, header=None, names=["Ticker", "Date", "Grade", "Cap"])
+        trades["Date"] = pd.to_datetime(trades["Date"], format='%m/%d/%y', errors='coerce').dt.strftime("%Y-%m-%d")
+        print(f"Raw trades data:\n{trades}")
+        print(f"trades dtypes: {trades.dtypes}")
+    except Exception as e:
+        print(f"Error reading Excel file: {str(e)}")
+        return
+
+    all_results = []
+    raw_data_sheets = {}
+    trade_logs = {}
+
+    for idx, row in trades.iterrows():
+        ticker = row["Ticker"]
+        date = pd.to_datetime(row["Date"], format='%Y-%m-%d', errors='coerce')
+        if pd.isna(date):
+            print(f"Skipping invalid date for Ticker {ticker} at row {idx}: {row['Date']}")
+            continue
+        date = date.strftime("%Y-%m-%d")
+        grade = row["Grade"]
+        cap = row["Cap"]
+        print(f"\nBacktesting {ticker} on {date} (Grade: {grade}, Cap: {cap})...")
+
+        for interval in intervals:
+            print(f" → Processing {ticker}, {date}, {interval}")
+            try:
+                df = fetch_intraday_bars(ticker, date, interval=interval)
+                if df.empty:
+                    print(f" → No data for {ticker} on {date} at {interval}")
+                    continue
+
+                df_for_backtest = df.copy()
+                df_raw = df.copy().reset_index()
+                df_raw.rename(columns={df_raw.columns[0]: 'timestamp'}, inplace=True)
+                raw_data_sheets[f"{ticker}_{interval}"] = df_raw
+
+                old_stdout = sys.stdout
+                sys.stdout = buffer = io.StringIO()
+                stats = run_capitulation_short_strategy_with_metrics(df_for_backtest, start_time, end_time)
+                trade_log = buffer.getvalue().splitlines()
+                sys.stdout = old_stdout
+                trade_logs[f"{ticker}_{interval}"] = trade_log
+
+                result = {
+                    "Ticker": ticker,
+                    "Date": date,
+                    "Interval": interval,
+                    "P&L": round(stats.get("pnl", 0), 2),
+                    "EV": round(stats.get("EV", 0), 2),
+                    "Win Rate (%)": round(stats.get("win_rate", 0) / 100, 4),
+                    "Avg R/R": round(stats.get("avg_risk_reward", 0), 2),
+                    "Total Trades": stats.get("total_trades", 0),
+                    "Wins": stats.get("wins", 0),
+                    "Losses": stats.get("losses", 0),
+                    "Max P&L": round(stats.get("max_pnl", 0), 2),
+                    "Min P&L": round(stats.get("min_pnl", 0), 2),
+                    "Total % Return": round(stats.get("total_percent_return", 0) / 100, 4),
+                    "Avg % Return": round(stats.get("avg_percent_return", 0) / 100, 4),
+                    "EV/AVG RISK": round(stats.get("ev_risk", 0), 2),
+                }
+                all_results.append(result)
+                print(f" → Successfully processed {ticker}, {date}, {interval}")
+            except Exception as e:
+                print(f" → Error processing {ticker}, {date}, {interval}: {str(e)}")
+                print(f" → Stack trace: {traceback.format_exc()}")
+                continue
+
+    summary_df = pd.DataFrame(all_results).drop_duplicates(subset=["Ticker", "Interval", "Date"])
+
+    summary_df = summary_df.merge(trades[["Ticker", "Date"]], on=["Ticker", "Date"], how="left")
+    summary_df['original_index'] = summary_df.apply(lambda row: trades.index[trades['Ticker'] == row['Ticker']][0], axis=1)
+    summary_df = summary_df.sort_values(by="original_index").drop(columns=["original_index"])
+
+    interval_summary = summary_df.groupby("Interval").agg({
+        "P&L": "sum",
+        "EV": "mean",
+        "Win Rate (%)": "mean",
+        "Avg R/R": "mean",
+        "Total % Return": "sum",
+        "Avg % Return": "mean",
+        "EV/AVG RISK": "mean",
+    }).reset_index()
+
+    interval_summary = interval_summary.rename(columns={
+        "P&L": "Total P&L",
+        "EV": "Avg EV",
+        "Win Rate (%)": "Avg Win Rate (%)",
+        "Avg R/R": "Avg Risk/Reward",
+        "Total % Return": "Total % Return",
+        "Avg % Return": "Avg % Return",
+        "EV/AVG RISK": "Avg EV/AVG RISK",
+    })
+
+    interval_summary["Avg EV"] = interval_summary["Avg EV"].round(2)
+    interval_summary["Avg Risk/Reward"] = interval_summary["Avg Risk/Reward"].round(2)
+    interval_summary["Avg EV/AVG RISK"] = interval_summary["Avg EV/AVG RISK"].round(2)
+    interval_summary["SortKey"] = interval_summary["Interval"].str.extract(r'(\d+)').astype(int)
+    interval_summary = interval_summary.sort_values(by="SortKey").drop(columns=["SortKey"])
+
+    pivot_df = summary_df.pivot_table(index="Ticker", columns="Interval", values="EV", aggfunc="mean").reset_index()
+    chart_start_row = len(interval_summary) + 5
+
+    with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
+        workbook = writer.book
+        workbook.nan_inf_to_errors = True
+
+        raw_sheet_name = "Raw Data"
+        raw_ws = workbook.add_worksheet(raw_sheet_name)
+        writer.sheets[raw_sheet_name] = raw_ws
+
+        header_format = workbook.add_format({
+            'bold': True, 'align': 'center', 'valign': 'vcenter', 'border': 1, 'bg_color': '#D9D9D9'
+        })
+        date_format = workbook.add_format({'num_format': 'yyyy-mm-dd hh:mm:ss', 'align': 'center'})
+        col_format = workbook.add_format({'align': 'center'})
+        start_row = 0
+
+        for sheet_name, df_raw in raw_data_sheets.items():
+            ticker, interval = sheet_name.split('_')
+            interval_num = interval.replace('min', '')
+            date_str = pd.to_datetime(df_raw['timestamp'].iloc[0]).strftime("%Y-%m-%d")
+            header_title = f"{ticker} - Interval: {interval_num}min [{date_str}]"
+
+            raw_ws.merge_range(start_row, 0, start_row, len(df_raw.columns)-1, header_title, header_format)
+            for col_idx, col_name in enumerate(df_raw.columns):
+                raw_ws.write(start_row + 1, col_idx, col_name, header_format)
+            for row_idx, (_, row) in enumerate(df_raw.iterrows()):
+                for col_idx, col_name in enumerate(df_raw.columns):
+                    val = row[col_name]
+                    if col_name == 'timestamp':
+                        raw_ws.write_datetime(start_row + 2 + row_idx, col_idx, val, date_format)
+                    else:
+                        raw_ws.write(start_row + 2 + row_idx, col_idx, val, col_format)
+
+            trade_log = trade_logs.get(sheet_name, [])
+            trade_log_format = workbook.add_format({'align': 'left'})
+            first_data_row = start_row + 2
+            for log_idx, log_entry in enumerate(trade_log):
+                raw_ws.write(first_data_row + log_idx, 6, log_entry, trade_log_format)
+
+            for col_idx, col_name in enumerate(df_raw.columns):
+                max_len = max(df_raw[col_name].astype(str).map(len).max(), len(col_name)) + 2
+                if pd.isna(max_len): max_len = 10
+                raw_ws.set_column(col_idx, col_idx, max_len)
+            max_log_len = max([len(entry) for entry in trade_log] + [10]) if trade_log else 10
+            raw_ws.set_column(6, 6, max_log_len)
+
+            start_row += len(df_raw) + 3
+
+        summary_df.to_excel(writer, sheet_name="Trade Results", index=False, startrow=0)
+        interval_summary.to_excel(writer, sheet_name="Summary by Interval", index=False)
+        pivot_df.to_excel(writer, sheet_name="Summary by Interval", index=False, startrow=chart_start_row)
+
+        summary_ws = writer.sheets["Summary by Interval"]
+        results_ws = writer.sheets["Trade Results"]
+
+        current_row = 1
+        prev_ticker = None
+        for idx, row in summary_df.iterrows():
+            ticker = row["Ticker"]
+            if prev_ticker and ticker != prev_ticker:
+                current_row += 1
+            for col_idx, value in enumerate(row):
+                write_value = "" if pd.isna(value) else value
+                results_ws.write(current_row, col_idx, write_value)
+            current_row += 1
+            if idx == len(summary_df) - 1 or summary_df.iloc[idx + 1]["Ticker"] != ticker:
+                current_row += 1
+            prev_ticker = ticker
+
+        for col_idx, column in enumerate(summary_df.columns):
+            results_ws.write(0, col_idx, column)
+
+        for i, column in enumerate(summary_df.columns):
+            max_len = max(summary_df[column].astype(str).map(len).max(), len(column)) + 2
+            if pd.isna(max_len): max_len = 10
+            fmt = None
+            if column in ["Win Rate (%)", "Total % Return", "Avg % Return"]:
+                fmt = workbook.add_format({'num_format': '0.00%', 'align': 'center'})
+            elif column == "EV/AVG RISK":
+                fmt = workbook.add_format({'num_format': '0.00', 'align': 'center'})
+            results_ws.set_column(i, i, max_len, fmt)
+
+        for i, column in enumerate(interval_summary.columns):
+            col_data = interval_summary[column]
+            max_len = max(col_data.astype(str).map(len).max(), len(column)) + 2
+            if pd.isna(max_len): max_len = 10
+            fmt = None
+            if column in ["Avg Win Rate (%)", "Total % Return", "Avg % Return"]:
+                fmt = workbook.add_format({'num_format': '0.00%', 'align': 'center'})
+            elif column == "Avg EV/AVG RISK":
+                fmt = workbook.add_format({'num_format': '0.00', 'align': 'center'})
+            summary_ws.set_column(i, i, max_len, fmt)
+
+        number_format = workbook.add_format({'num_format': '0.00', 'align': 'center'})
+        for j in range(1, len(pivot_df.columns)):
+            max_len = max(pivot_df.iloc[:, j].astype(str).map(len).max(), len(pivot_df.columns[j])) + 2
+            if pd.isna(max_len): max_len = 10
+            summary_ws.set_column(j, j, max_len, number_format)
+
+        pivot_df_chart = summary_df.pivot_table(index="Ticker", values="EV", columns="Interval", aggfunc="mean")
+        pivot_df_chart = pivot_df_chart[sorted(pivot_df_chart.columns, key=lambda x: int(x.replace('min', '')))]
+        pivot_df_chart = pivot_df_chart.reset_index()
+        pivot_df_chart.to_excel(writer, sheet_name="Summary by Interval", index=False, startrow=chart_start_row)
+
+        chart = workbook.add_chart({'type': 'column'})
+        chart.add_series({
+            'name': 'Avg EV',
+            'categories': ['Summary by Interval', 1, 0, len(interval_summary), 0],
+            'values': ['Summary by Interval', 1, 2, len(interval_summary), 2],
+            'fill': {'color': '#BFBFBF'},
+            'border': {'color': 'black'}
+        })
+        # Overlay ticker line charts
+        for i in range(len(pivot_df)):
+            ticker = pivot_df.loc[i, "Ticker"]
+            chart.add_series({
+                'name':       ticker,
+                'categories': ['Summary by Interval', chart_start_row, 1,
+                               chart_start_row, len(pivot_df.columns) - 1],
+                'values':     ['Summary by Interval', chart_start_row + 1 + i, 1,
+                               chart_start_row + 1 + i, len(pivot_df.columns) - 1],
+                'type': 'line',
+                'marker': {'type': 'circle', 'size': 4}
+            })
+
+        chart.set_title({'name': 'Interval vs Avg EV (w/ Ticker Overlay)'})
+        chart.set_x_axis({'name': 'Interval', 'label_position': 'low'})
+        chart.set_y_axis({'name': 'Expected Value'})
+        chart.set_size({'width': 720, 'height': 400})
+        summary_ws.insert_chart("I2", chart)
+
+
+        trades_full = pd.read_excel(excel_path, header=None, names=["Ticker", "Date", "Grade", "Cap"])
+        trades_full["Date"] = pd.to_datetime(trades_full["Date"], format='%m/%d/%y', errors='coerce').dt.strftime("%Y-%m-%d")
+        trades_full["Cap"] = trades_full["Cap"].str.lower().replace({"medium": "Medium"})
+        cap_grade_df = trades_full.merge(summary_df, on=["Ticker", "Date"], how="left")
+        cap_grade_df["Grade"] = cap_grade_df["Grade"].fillna("Unknown")
+        cap_grade_df["Cap"] = cap_grade_df["Cap"].fillna("Unknown")
+        print(f"cap_grade_df:\n{cap_grade_df}")
+
+        grade_summary = cap_grade_df.groupby("Grade").agg({"EV": "mean"}).reset_index()
+        grade_summary = grade_summary.rename(columns={"EV": "Avg EV by Grade"})
+        cap_summary = cap_grade_df.groupby("Cap").agg({"EV": "mean"}).reset_index()
+        cap_summary = cap_summary.rename(columns={"EV": "Avg EV by Cap"})
+        print(f"grade_summary:\n{grade_summary}")
+        print(f"cap_summary:\n{cap_summary}")
+
+        analysis_ws = workbook.add_worksheet("Cap & Grade Analysis")
+        analysis_ws.write(0, 0, "Grade")
+        analysis_ws.write(0, 1, "Avg EV by Grade")
+        for i, row in grade_summary.iterrows():
+            analysis_ws.write(i + 1, 0, row["Grade"])
+            analysis_ws.write(i + 1, 1, row["Avg EV by Grade"])
+        analysis_ws.write(0, 15, "Cap")
+        analysis_ws.write(0, 16, "Avg EV by Cap")
+        for i, row in cap_summary.iterrows():
+            analysis_ws.write(i + 1, 15, row["Cap"])
+            analysis_ws.write(i + 1, 16, row["Avg EV by Cap"])
+
+        for i, column in enumerate(["Grade", "Avg EV by Grade"]):
+            max_len = max(grade_summary[column].astype(str).map(len).max(), len(column)) + 2 if not grade_summary.empty else 10
+            fmt = workbook.add_format({'num_format': '0.00', 'align': 'center'}) if column == "Avg EV by Grade" else workbook.add_format({'align': 'center'})
+            analysis_ws.set_column(i, i, max_len, fmt)
+        for i, column in enumerate(["Cap", "Avg EV by Cap"]):
+            col_idx = i + 15
+            max_len = max(cap_summary[column].astype(str).map(len).max(), len(column)) + 2 if not cap_summary.empty else 10
+            fmt = workbook.add_format({'num_format': '0.00', 'align': 'center'}) if column == "Avg EV by Cap" else workbook.add_format({'align': 'center'})
+            analysis_ws.set_column(col_idx, col_idx, max_len, fmt)
+
+        if not grade_summary.empty:
+            grade_chart = workbook.add_chart({'type': 'column'})
+            grade_chart.add_series({
+                'name': 'Avg EV by Grade',
+                'categories': ['Cap & Grade Analysis', 1, 0, len(grade_summary), 0],
+                'values': ['Cap & Grade Analysis', 1, 1, len(grade_summary), 1],
+                'fill': {'color': '#BFBFBF'},
+                'border': {'color': 'black'}
+            })
+            grade_chart.set_title({'name': 'Avg EV by Grade Across Companies'})
+            grade_chart.set_x_axis({'name': 'Grade', 'label_position': 'low'})
+            grade_chart.set_y_axis({'name': 'Avg Expected Value'})
+            grade_chart.set_size({'width': 720, 'height': 400})
+            analysis_ws.insert_chart('E2', grade_chart)
+
+        if not cap_summary.empty:
+            cap_chart = workbook.add_chart({'type': 'column'})
+            cap_chart.add_series({
+                'name': 'Avg EV by Cap',
+                'categories': ['Cap & Grade Analysis', 1, 15, len(cap_summary), 15],
+                'values': ['Cap & Grade Analysis', 1, 16, len(cap_summary), 16],
+                'fill': {'color': '#BFBFBF'},
+                'border': {'color': 'black'}
+            })
+            cap_chart.set_title({'name': 'Avg EV by Cap Type Across Companies'})
+            cap_chart.set_x_axis({'name': 'Cap Type', 'label_position': 'low'})
+            cap_chart.set_y_axis({'name': 'Avg Expected Value'})
+            cap_chart.set_size({'width': 720, 'height': 400})
+            analysis_ws.insert_chart('S2', cap_chart)
+
+    print(f"All done! Results saved to '{output_path}'")
+
+
+"""""
+if __name__ == "__main__":
+    excel_path = "/Users/ishanshetty/Desktop/capitulationAnalyzer/tradeList.xlsx"
+    intervals = ["15min", "30min"]
+    start_time = "09:30"
+    end_time = "16:00"
+    output_path = "/Users/ishanshetty/Desktop/capitulationAnalyzer/output.xlsx"
+    backtest_multiple_trades(excel_path, intervals, start_time, end_time, output_path)
+"""""
+
+
+########################################################
+
+
+
+
+
+
+
+
+BACKTEST THAT works BELOW
+
+
+import pandas as pd
+import sys
+import os
+import io
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from marketData.fetchData import fetch_intraday_bars
+from backtester.analyze import run_capitulation_short_strategy_with_metrics
+
+def backtest_multiple_trades(excel_path, intervals, start_time, end_time, output_path):
+    # Read trades from Excel
+    trades = pd.read_excel(excel_path, header=None, names=["Ticker", "Date", "Grade", "Cap"])
+    trades["Date"] = pd.to_datetime(trades["Date"], format='%m/%d/%y', errors='coerce').dt.strftime("%Y-%m-%d")
+    print(f"Raw trades data:\n{trades}")
+
+    all_results = []
+    raw_data_sheets = {}
+    trade_logs = {}
+
+    # Process each trade
+    for idx, row in trades.iterrows():
+        ticker = row["Ticker"]
+        date = row["Date"]
+        grade = row["Grade"]
+        cap = row["Cap"]
+        print(f"\nBacktesting {ticker} on {date} (Grade: {grade}, Cap: {cap})...")
+
+        for interval in intervals:
+            #print(f" → Processing {ticker}, {date}, {interval}")
+            try:
+                df = fetch_intraday_bars(ticker, date, interval=interval)
+                if df.empty:
+                    print(f" → No data for {ticker} on {date} at {interval}")
+                    continue
+
+                df_for_backtest = df.copy()
+                df_raw = df.copy().reset_index()
+                df_raw.rename(columns={df_raw.columns[0]: 'timestamp'}, inplace=True)
+                raw_data_sheets[f"{ticker}_{interval}"] = df_raw
+
+                old_stdout = sys.stdout
+                sys.stdout = buffer = io.StringIO()
+                stats = run_capitulation_short_strategy_with_metrics(df_for_backtest, start_time, end_time)
+                trade_log = buffer.getvalue().splitlines()
+                sys.stdout = old_stdout
+                trade_logs[f"{ticker}_{interval}"] = trade_log
+
+                result = {
+                    "Ticker": ticker,
+                    "Date": date,
+                    "Interval": interval,
+                    "P&L": round(stats.get("pnl", 0), 2),
+                    "EV": round(stats.get("EV", 0), 2),
+                    "Win Rate (%)": round(stats.get("win_rate", 0) / 100, 4),
+                    "Avg R/R": round(stats.get("avg_risk_reward", 0), 2),
+                    "Total Trades": stats.get("total_trades", 0),
+                    "Wins": stats.get("wins", 0),
+                    "Losses": stats.get("losses", 0),
+                    "Max P&L": round(stats.get("max_pnl", 0), 2),
+                    "Min P&L": round(stats.get("min_pnl", 0), 2),
+                    "Total % Return": round(stats.get("total_percent_return", 0) / 100, 4),
+                    "Avg % Return": round(stats.get("avg_percent_return", 0) / 100, 4),
+                }
+                all_results.append(result)
+                #print(f" → Successfully processed {ticker}, {date}, {interval}")
+            except Exception as e:
+                print(f" → Error processing {ticker}, {date}, {interval}: {str(e)}")
+                continue
+
+    # Create summary DataFrame
+    summary_df = pd.DataFrame(all_results).drop_duplicates(subset=["Ticker", "Interval", "Date"])
+
+    # Aggregate by interval
+    interval_summary = summary_df.groupby("Interval").agg({
+        "P&L": "sum",
+        "EV": "mean",
+        "Win Rate (%)": "mean",
+        "Avg R/R": "mean",
+        "Total % Return": "sum",
+        "Avg % Return": "mean",
+    }).reset_index()
+
+    interval_summary = interval_summary.rename(columns={
+        "P&L": "Total P&L",
+        "EV": "Avg EV",
+        "Win Rate (%)": "Avg Win Rate (%)",
+        "Avg R/R": "Avg Risk/Reward",
+        "Total % Return": "Total % Return",
+        "Avg % Return": "Avg % Return",
+    })
+
+    interval_summary["Avg EV"] = interval_summary["Avg EV"].round(2)
+    interval_summary["Avg Risk/Reward"] = interval_summary["Avg Risk/Reward"].round(2)
+    interval_summary["SortKey"] = interval_summary["Interval"].str.extract(r'(\d+)').astype(int)
+    interval_summary = interval_summary.sort_values(by="SortKey").drop(columns=["SortKey"])
+
+    # Write to Excel
+    with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
+        workbook = writer.book
+
+        # Raw Data sheet
+        raw_sheet_name = "Raw Data"
+        raw_ws = workbook.add_worksheet(raw_sheet_name)
+        writer.sheets[raw_sheet_name] = raw_ws
+
+        header_format = workbook.add_format({'bold': True, 'align': 'center', 'bg_color': '#D9D9D9'})
+        date_format = workbook.add_format({'num_format': 'yyyy-mm-dd hh:mm:ss', 'align': 'center'})
+        col_format = workbook.add_format({'align': 'center'})
+        start_row = 0
+
+        for sheet_name, df_raw in raw_data_sheets.items():
+            ticker, interval = sheet_name.split('_')
+            interval_num = interval.replace('min', '')
+            date_str = pd.to_datetime(df_raw['timestamp'].iloc[0]).strftime("%Y-%m-%d")
+            header_title = f"{ticker} - Interval: {interval_num}min [{date_str}]"
+
+            raw_ws.merge_range(start_row, 0, start_row, len(df_raw.columns)-1, header_title, header_format)
+            for col_idx, col_name in enumerate(df_raw.columns):
+                raw_ws.write(start_row + 1, col_idx, col_name, header_format)
+            for row_idx, (_, row) in enumerate(df_raw.iterrows()):
+                for col_idx, col_name in enumerate(df_raw.columns):
+                    val = row[col_name]
+                    if col_name == 'timestamp':
+                        raw_ws.write_datetime(start_row + 2 + row_idx, col_idx, val, date_format)
+                    else:
+                        raw_ws.write(start_row + 2 + row_idx, col_idx, val, col_format)
+
+            trade_log = trade_logs.get(sheet_name, [])
+            trade_log_format = workbook.add_format({'align': 'left'})
+            first_data_row = start_row + 2
+            for log_idx, log_entry in enumerate(trade_log):
+                raw_ws.write(first_data_row + log_idx, 6, log_entry, trade_log_format)
+
+            for col_idx, col_name in enumerate(df_raw.columns):
+                max_len = max(df_raw[col_name].astype(str).map(len).max(), len(col_name)) + 2
+                if pd.isna(max_len): max_len = 10
+                raw_ws.set_column(col_idx, col_idx, max_len)
+            max_log_len = max([len(entry) for entry in trade_log] + [10]) if trade_log else 10
+            raw_ws.set_column(6, 6, max_log_len)
+
+            start_row += len(df_raw) + 3
+
+        # Trade Results sheet
+        summary_df.to_excel(writer, sheet_name="Trade Results", index=False)
+
+        # Summary by Interval sheet
+        interval_summary.to_excel(writer, sheet_name="Summary by Interval", index=False)
+
+    print(f"All done! Results saved to '{output_path}'")
+
+
+
+
+#####
+#####
+
+FINAL WORKING CODE
+
+
+import pandas as pd
+import sys
+import os
+import io
+import traceback
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from marketData.fetchData import fetch_intraday_bars
+from backtester.analyze import run_capitulation_short_strategy_with_metrics
+
+def backtest_multiple_trades(excel_path, intervals, start_time, end_time, output_path):
+    # Read all four columns from the start
+    try:
+        trades = pd.read_excel(excel_path, header=None, names=["Ticker", "Date", "Grade", "Cap"])
+        trades["Date"] = pd.to_datetime(trades["Date"], format='%m/%d/%y', errors='coerce').dt.strftime("%Y-%m-%d")
+        print(f"Raw trades data:\n{trades}")
+        print(f"trades dtypes: {trades.dtypes}")
+    except Exception as e:
+        print(f"Error reading Excel file: {str(e)}")
+        return
+
+    all_results = []
+    raw_data_sheets = {}
+    trade_logs = {}
+
+    for idx, row in trades.iterrows():
+        ticker = row["Ticker"]
+        date = pd.to_datetime(row["Date"], format='%Y-%m-%d', errors='coerce')
+        if pd.isna(date):
+            print(f"Skipping invalid date for Ticker {ticker} at row {idx}: {row['Date']}")
+            continue
+        date = date.strftime("%Y-%m-%d")
+        grade = row["Grade"]
+        cap = row["Cap"]
+        print(f"\nBacktesting {ticker} on {date} (Grade: {grade}, Cap: {cap})...")
+
+        for interval in intervals:
+            print(f" → Processing {ticker}, {date}, {interval}")
+            try:
+                df = fetch_intraday_bars(ticker, date, interval=interval)
+                if df.empty:
+                    print(f" → No data for {ticker} on {date} at {interval}")
+                    continue
+
+                df_for_backtest = df.copy()
+                df_raw = df.copy().reset_index()
+                df_raw.rename(columns={df_raw.columns[0]: 'timestamp'}, inplace=True)
+                raw_data_sheets[f"{ticker}_{interval}"] = df_raw
+
+                old_stdout = sys.stdout
+                sys.stdout = buffer = io.StringIO()
+                stats = run_capitulation_short_strategy_with_metrics(df_for_backtest, start_time, end_time)
+                trade_log = buffer.getvalue().splitlines()
+                sys.stdout = old_stdout
+                trade_logs[f"{ticker}_{interval}"] = trade_log
+
+                result = {
+                    "Ticker": ticker,
+                    "Date": date,
+                    "Interval": interval,
+                    "P&L": round(stats.get("pnl", 0), 2),
+                    "EV": round(stats.get("EV", 0), 2),
+                    "Win Rate (%)": round(stats.get("win_rate", 0) / 100, 4),
+                    "Avg R/R": round(stats.get("avg_risk_reward", 0), 2),
+                    "Total Trades": stats.get("total_trades", 0),
+                    "Wins": stats.get("wins", 0),
+                    "Losses": stats.get("losses", 0),
+                    "Max P&L": round(stats.get("max_pnl", 0), 2),
+                    "Min P&L": round(stats.get("min_pnl", 0), 2),
+                    "Total % Return": round(stats.get("total_percent_return", 0) / 100, 4),
+                    "Avg % Return": round(stats.get("avg_percent_return", 0) / 100, 4),
+                    "EV/AVG RISK": round(stats.get("ev_risk", 0), 2),
+                }
+                all_results.append(result)
+                print(f" → Successfully processed {ticker}, {date}, {interval}")
+            except Exception as e:
+                print(f" → Error processing {ticker}, {date}, {interval}: {str(e)}")
+                print(f" → Stack trace: {traceback.format_exc()}")
+                continue
+
+    summary_df = pd.DataFrame(all_results).drop_duplicates(subset=["Ticker", "Interval", "Date"])
+
+    summary_df = summary_df.merge(trades[["Ticker", "Date"]], on=["Ticker", "Date"], how="left")
+    summary_df['original_index'] = summary_df.apply(lambda row: trades.index[trades['Ticker'] == row['Ticker']][0], axis=1)
+    summary_df = summary_df.sort_values(by="original_index").drop(columns=["original_index"])
+
+    interval_summary = summary_df.groupby("Interval").agg({
+        "P&L": "sum",
+        "EV": "mean",
+        "Win Rate (%)": "mean",
+        "Avg R/R": "mean",
+        "Total % Return": "sum",
+        "Avg % Return": "mean",
+        "EV/AVG RISK": "mean",
+    }).reset_index()
+
+    interval_summary = interval_summary.rename(columns={
+        "P&L": "Total P&L",
+        "EV": "Avg EV",
+        "Win Rate (%)": "Avg Win Rate (%)",
+        "Avg R/R": "Avg Risk/Reward",
+        "Total % Return": "Total % Return",
+        "Avg % Return": "Avg % Return",
+        "EV/AVG RISK": "Avg EV/AVG RISK",
+    })
+
+    interval_summary["Avg EV"] = interval_summary["Avg EV"].round(2)
+    interval_summary["Avg Risk/Reward"] = interval_summary["Avg Risk/Reward"].round(2)
+    interval_summary["Avg EV/AVG RISK"] = interval_summary["Avg EV/AVG RISK"].round(2)
+    interval_summary["SortKey"] = interval_summary["Interval"].str.extract(r'(\d+)').astype(int)
+    interval_summary = interval_summary.sort_values(by="SortKey").drop(columns=["SortKey"])
+
+    pivot_df = summary_df.pivot_table(index="Ticker", columns="Interval", values="EV", aggfunc="mean").reset_index()
+    chart_start_row = len(interval_summary) + 5
+
+    with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
+        workbook = writer.book
+        workbook.nan_inf_to_errors = True
+
+        raw_sheet_name = "Raw Data"
+        raw_ws = workbook.add_worksheet(raw_sheet_name)
+        writer.sheets[raw_sheet_name] = raw_ws
+
+        header_format = workbook.add_format({
+            'bold': True, 'align': 'center', 'valign': 'vcenter', 'border': 1, 'bg_color': '#D9D9D9'
+        })
+        date_format = workbook.add_format({'num_format': 'yyyy-mm-dd hh:mm:ss', 'align': 'center'})
+        col_format = workbook.add_format({'align': 'center'})
+        start_row = 0
+
+        for sheet_name, df_raw in raw_data_sheets.items():
+            ticker, interval = sheet_name.split('_')
+            interval_num = interval.replace('min', '')
+            date_str = pd.to_datetime(df_raw['timestamp'].iloc[0]).strftime("%Y-%m-%d")
+            header_title = f"{ticker} - Interval: {interval_num}min [{date_str}]"
+
+            raw_ws.merge_range(start_row, 0, start_row, len(df_raw.columns)-1, header_title, header_format)
+            for col_idx, col_name in enumerate(df_raw.columns):
+                raw_ws.write(start_row + 1, col_idx, col_name, header_format)
+            for row_idx, (_, row) in enumerate(df_raw.iterrows()):
+                for col_idx, col_name in enumerate(df_raw.columns):
+                    val = row[col_name]
+                    if col_name == 'timestamp':
+                        raw_ws.write_datetime(start_row + 2 + row_idx, col_idx, val, date_format)
+                    else:
+                        raw_ws.write(start_row + 2 + row_idx, col_idx, val, col_format)
+
+            trade_log = trade_logs.get(sheet_name, [])
+            trade_log_format = workbook.add_format({'align': 'left'})
+            first_data_row = start_row + 2
+            for log_idx, log_entry in enumerate(trade_log):
+                raw_ws.write(first_data_row + log_idx, 6, log_entry, trade_log_format)
+
+            for col_idx, col_name in enumerate(df_raw.columns):
+                max_len = max(df_raw[col_name].astype(str).map(len).max(), len(col_name)) + 2
+                if pd.isna(max_len): max_len = 10
+                raw_ws.set_column(col_idx, col_idx, max_len)
+            max_log_len = max([len(entry) for entry in trade_log] + [10]) if trade_log else 10
+            raw_ws.set_column(6, 6, max_log_len)
+
+            start_row += len(df_raw) + 3
+
+        summary_df.to_excel(writer, sheet_name="Trade Results", index=False, startrow=0)
+        interval_summary.to_excel(writer, sheet_name="Summary by Interval", index=False)
+        pivot_df.to_excel(writer, sheet_name="Summary by Interval", index=False, startrow=chart_start_row)
+
+        summary_ws = writer.sheets["Summary by Interval"]
+        results_ws = writer.sheets["Trade Results"]
+
+        current_row = 1
+        prev_ticker = None
+        for idx, row in summary_df.iterrows():
+            ticker = row["Ticker"]
+            if prev_ticker and ticker != prev_ticker:
+                current_row += 1
+            for col_idx, value in enumerate(row):
+                write_value = "" if pd.isna(value) else value
+                results_ws.write(current_row, col_idx, write_value)
+            current_row += 1
+            if idx == len(summary_df) - 1 or summary_df.iloc[idx + 1]["Ticker"] != ticker:
+                current_row += 1
+            prev_ticker = ticker
+
+        for col_idx, column in enumerate(summary_df.columns):
+            results_ws.write(0, col_idx, column)
+
+        for i, column in enumerate(summary_df.columns):
+            max_len = max(summary_df[column].astype(str).map(len).max(), len(column)) + 2
+            if pd.isna(max_len): max_len = 10
+            fmt = None
+            if column in ["Win Rate (%)", "Total % Return", "Avg % Return"]:
+                fmt = workbook.add_format({'num_format': '0.00%', 'align': 'center'})
+            elif column == "EV/AVG RISK":
+                fmt = workbook.add_format({'num_format': '0.00', 'align': 'center'})
+            results_ws.set_column(i, i, max_len, fmt)
+
+        for i, column in enumerate(interval_summary.columns):
+            col_data = interval_summary[column]
+            max_len = max(col_data.astype(str).map(len).max(), len(column)) + 2
+            if pd.isna(max_len): max_len = 10
+            fmt = None
+            if column in ["Avg Win Rate (%)", "Total % Return", "Avg % Return"]:
+                fmt = workbook.add_format({'num_format': '0.00%', 'align': 'center'})
+            elif column == "Avg EV/AVG RISK":
+                fmt = workbook.add_format({'num_format': '0.00', 'align': 'center'})
+            summary_ws.set_column(i, i, max_len, fmt)
+
+        number_format = workbook.add_format({'num_format': '0.00', 'align': 'center'})
+        for j in range(1, len(pivot_df.columns)):
+            max_len = max(pivot_df.iloc[:, j].astype(str).map(len).max(), len(pivot_df.columns[j])) + 2
+            if pd.isna(max_len): max_len = 10
+            summary_ws.set_column(j, j, max_len, number_format)
+
+        pivot_df_chart = summary_df.pivot_table(index="Ticker", values="EV", columns="Interval", aggfunc="mean")
+        pivot_df_chart = pivot_df_chart[sorted(pivot_df_chart.columns, key=lambda x: int(x.replace('min', '')))]
+        pivot_df_chart = pivot_df_chart.reset_index()
+        pivot_df_chart.to_excel(writer, sheet_name="Summary by Interval", index=False, startrow=chart_start_row)
+
+        chart = workbook.add_chart({'type': 'column'})
+        chart.add_series({
+            'name': 'Avg EV',
+            'categories': ['Summary by Interval', 1, 0, len(interval_summary), 0],
+            'values': ['Summary by Interval', 1, 2, len(interval_summary), 2],
+            'fill': {'color': '#BFBFBF'},
+            'border': {'color': 'black'}
+        })
+        # Overlay ticker line charts
+        for i in range(len(pivot_df)):
+            ticker = pivot_df.loc[i, "Ticker"]
+            chart.add_series({
+                'name':       ticker,
+                'categories': ['Summary by Interval', chart_start_row, 1,
+                               chart_start_row, len(pivot_df.columns) - 1],
+                'values':     ['Summary by Interval', chart_start_row + 1 + i, 1,
+                               chart_start_row + 1 + i, len(pivot_df.columns) - 1],
+                'type': 'line',
+                'marker': {'type': 'circle', 'size': 4}
+            })
+
+        chart.set_title({'name': 'Interval vs Avg EV (w/ Ticker Overlay)'})
+        chart.set_x_axis({'name': 'Interval', 'label_position': 'low'})
+        chart.set_y_axis({'name': 'Expected Value'})
+        chart.set_size({'width': 720, 'height': 400})
+        summary_ws.insert_chart("J2", chart)
+
+
+        trades_full = pd.read_excel(excel_path, header=None, names=["Ticker", "Date", "Grade", "Cap"])
+        trades_full["Date"] = pd.to_datetime(trades_full["Date"], format='%m/%d/%y', errors='coerce').dt.strftime("%Y-%m-%d")
+        trades_full["Cap"] = trades_full["Cap"].str.lower().replace({"medium": "Medium"})
+        cap_grade_df = trades_full.merge(summary_df, on=["Ticker", "Date"], how="left")
+        cap_grade_df["Grade"] = cap_grade_df["Grade"].fillna("Unknown")
+        cap_grade_df["Cap"] = cap_grade_df["Cap"].fillna("Unknown")
+        print(f"cap_grade_df:\n{cap_grade_df}")
+
+        grade_summary = cap_grade_df.groupby("Grade").agg({"EV": "mean"}).reset_index()
+        grade_summary = grade_summary.rename(columns={"EV": "Avg EV by Grade"})
+        cap_summary = cap_grade_df.groupby("Cap").agg({"EV": "mean"}).reset_index()
+        cap_summary = cap_summary.rename(columns={"EV": "Avg EV by Cap"})
+        print(f"grade_summary:\n{grade_summary}")
+        print(f"cap_summary:\n{cap_summary}")
+
+        analysis_ws = workbook.add_worksheet("Cap & Grade Analysis")
+        analysis_ws.write(0, 0, "Grade")
+        analysis_ws.write(0, 1, "Avg EV by Grade")
+        for i, row in grade_summary.iterrows():
+            analysis_ws.write(i + 1, 0, row["Grade"])
+            analysis_ws.write(i + 1, 1, row["Avg EV by Grade"])
+        analysis_ws.write(0, 15, "Cap")
+        analysis_ws.write(0, 16, "Avg EV by Cap")
+        for i, row in cap_summary.iterrows():
+            analysis_ws.write(i + 1, 15, row["Cap"])
+            analysis_ws.write(i + 1, 16, row["Avg EV by Cap"])
+
+        for i, column in enumerate(["Grade", "Avg EV by Grade"]):
+            max_len = max(grade_summary[column].astype(str).map(len).max(), len(column)) + 2 if not grade_summary.empty else 10
+            fmt = workbook.add_format({'num_format': '0.00', 'align': 'center'}) if column == "Avg EV by Grade" else workbook.add_format({'align': 'center'})
+            analysis_ws.set_column(i, i, max_len, fmt)
+        for i, column in enumerate(["Cap", "Avg EV by Cap"]):
+            col_idx = i + 15
+            max_len = max(cap_summary[column].astype(str).map(len).max(), len(column)) + 2 if not cap_summary.empty else 10
+            fmt = workbook.add_format({'num_format': '0.00', 'align': 'center'}) if column == "Avg EV by Cap" else workbook.add_format({'align': 'center'})
+            analysis_ws.set_column(col_idx, col_idx, max_len, fmt)
+
+        if not grade_summary.empty:
+            grade_chart = workbook.add_chart({'type': 'column'})
+            grade_chart.add_series({
+                'name': 'Avg EV by Grade',
+                'categories': ['Cap & Grade Analysis', 1, 0, len(grade_summary), 0],
+                'values': ['Cap & Grade Analysis', 1, 1, len(grade_summary), 1],
+                'fill': {'color': '#BFBFBF'},
+                'border': {'color': 'black'}
+            })
+            grade_chart.set_title({'name': 'Avg EV by Grade Across Companies'})
+            grade_chart.set_x_axis({'name': 'Grade', 'label_position': 'low'})
+            grade_chart.set_y_axis({'name': 'Avg Expected Value'})
+            grade_chart.set_size({'width': 720, 'height': 400})
+            analysis_ws.insert_chart('C2', grade_chart)
+
+        if not cap_summary.empty:
+            cap_chart = workbook.add_chart({'type': 'column'})
+            cap_chart.add_series({
+                'name': 'Avg EV by Cap',
+                'categories': ['Cap & Grade Analysis', 1, 15, len(cap_summary), 15],
+                'values': ['Cap & Grade Analysis', 1, 16, len(cap_summary), 16],
+                'fill': {'color': '#BFBFBF'},
+                'border': {'color': 'black'}
+            })
+            cap_chart.set_title({'name': 'Avg EV by Cap Type Across Companies'})
+            cap_chart.set_x_axis({'name': 'Cap Type', 'label_position': 'low'})
+            cap_chart.set_y_axis({'name': 'Avg Expected Value'})
+            cap_chart.set_size({'width': 720, 'height': 400})
+            analysis_ws.insert_chart('R2', cap_chart)
+
+    print(f"All done! Results saved to '{output_path}'")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

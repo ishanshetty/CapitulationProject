@@ -1,0 +1,4 @@
+# shelConfig.py
+# === SHEL DATA GATEWAY CREDENTIALS === 
+SHEL_USERNAME = ""
+SHEL_PASSWORD = ""
